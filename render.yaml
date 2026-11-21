@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: gofatho-ai-rag-server
+    runtime: docker
+    plan: free
+    envVars:
+      - key: PORT
+        value: 7860
+      - key: GOFATHO_DB_PATH
+        value: /app/data/gofatho_ai_master.sqlite
+      - key: GEMINI_API_KEY
+        sync: false
