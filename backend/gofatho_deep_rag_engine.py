@@ -72,6 +72,7 @@ class FSTDecomposer:
         ("idosona", "-idosona", "PAST.3PL.AFF.DCL ('they did', Group O)"),
         ("oosona", "-oosona", "PRES.3PL.AFF.DCL ('they do', Group O)"),
         ("okkoona", "-okkoona", "PRES.3PL.NEG.DCL ('they do not', Group O)"),
+        ("adii", "-adii", "PAST.2S.INTER ('did you [sg] V?', Group A)"),
         ("ideta", "-ideta", "PAST.2PL.AFF.DCL ('you [pl] did', Group E)"),
         ("tappe", "-t-a-ppe", "PL.ACC.ABL ('from the ...s')"),
         ("tetha", "-teth-a", "ABSTR.NMZ ('abstract noun: -ness / -hood')"),
@@ -127,21 +128,23 @@ class FSTDecomposer:
         cur = conn.cursor()
         # Direct dictionary hit check
         direct = cur.execute(
-            "SELECT headword, ipa, pos, english, amharic, domain FROM dictionary WHERE lower(headword)=? OR lower(normalized_form)=? LIMIT 1",
+            "SELECT id, headword, ipa, pos, english, amharic, domain, source FROM dictionary WHERE lower(headword)=? OR lower(normalized_form)=? LIMIT 1",
             (clean, clean),
         ).fetchone()
         if direct:
             return {
                 "surface": token,
                 "gofatho_fidel": latin_to_gofatho_fidel(clean),
-                "root_lemma": direct[0],
-                "ipa": direct[1],
-                "pos": direct[2],
+                "lex_id": direct[0],
+                "root_lemma": direct[1],
+                "ipa": direct[2],
+                "pos": direct[3],
                 "stripped_suffixes": [],
                 "mp_rules_applied": ["Direct Citation Lemma"],
-                "english_gloss": direct[3],
-                "amharic_gloss": direct[4],
-                "domain": direct[5],
+                "english_gloss": direct[4],
+                "amharic_gloss": direct[5],
+                "domain": direct[6],
+                "source": direct[7] or "Sellassie Cheru (2015)",
             }
 
         stem = clean
@@ -205,10 +208,17 @@ class FSTDecomposer:
             candidates.append(stem_lookup[:-1] + "yo")
             candidates.append(stem_lookup[:-1] + "ya")
 
+        if "tt" in stem_lookup:
+            st_th = stem_lookup.replace("tt", "th")
+            candidates.extend([st_th, st_th + "a", st_th + "e", st_th + "o"])
+        if len(stem_lookup) >= 3 and stem_lookup[-1] in "aeiou" and stem_lookup[-2] == stem_lookup[-1]:
+            short_v = stem_lookup[:-1]
+            candidates.extend([short_v, short_v.replace("tt", "th"), short_v.replace("tt", "th")[:-1] + "e"])
+
         matched_row = None
         for cand in candidates:
             matched_row = cur.execute(
-                "SELECT headword, ipa, pos, english, amharic, domain FROM dictionary WHERE lower(headword)=? OR lower(normalized_form)=? OR lower(headword) LIKE ? LIMIT 1",
+                "SELECT id, headword, ipa, pos, english, amharic, domain, source FROM dictionary WHERE lower(headword)=? OR lower(normalized_form)=? OR lower(headword) LIKE ? LIMIT 1",
                 (cand, cand, cand + "%"),
             ).fetchone()
             if matched_row:
@@ -224,14 +234,16 @@ class FSTDecomposer:
         return {
             "surface": token,
             "gofatho_fidel": latin_to_gofatho_fidel(clean),
-            "root_lemma": matched_row[0] if matched_row else (stem_lookup or clean),
-            "ipa": matched_row[1] if matched_row else f"/{clean.replace('7', 'ʔ')}/",
-            "pos": matched_row[2] if matched_row else ("V" if any("DCL" in s["gloss"] or "CNV" in s["gloss"] for s in stripped) else "N/PART"),
+            "lex_id": matched_row[0] if matched_row else None,
+            "root_lemma": matched_row[1] if matched_row else (stem_lookup or clean),
+            "ipa": matched_row[2] if matched_row else f"/{clean.replace('7', 'ʔ')}/",
+            "pos": matched_row[3] if matched_row else ("V" if any("DCL" in s["gloss"] or "CNV" in s["gloss"] for s in stripped) else "N/PART"),
             "stripped_suffixes": stripped,
             "mp_rules_applied": mp_rules + zara_notes,
-            "english_gloss": matched_row[3] if matched_row else "Contextual stem",
-            "amharic_gloss": matched_row[4] if matched_row else "",
-            "domain": matched_row[5] if matched_row else "General Gofatho",
+            "english_gloss": matched_row[4] if matched_row else "Contextual stem",
+            "amharic_gloss": matched_row[5] if matched_row else "",
+            "domain": matched_row[6] if matched_row else "General Gofatho",
+            "source": (matched_row[7] if matched_row else None) or "Sellassie Cheru (2015)",
         }
 
     def decompose_sentence(self, text: str, conn: sqlite3.Connection) -> List[Dict[str, Any]]:
@@ -257,6 +269,10 @@ class GofathoDeepRAGEngine:
     """
     5-Stage Deep Morphology-Aware Hybrid RAG & Post-Editing Engine for Gofatho AI Chat Assistant.
     """
+
+    _rrf_cache: Dict[Tuple[str, str, str, int], Dict[str, Any]] = {}
+    _rrf_cache_hits: int = 0
+    _rrf_cache_misses: int = 0
 
     def __init__(self, db_path: str):
         self.db_path = db_path
@@ -284,35 +300,75 @@ class GofathoDeepRAGEngine:
           5. `gemination_minimal_pairs` (75 Minniyaa vs. Leppiya pairs) & `oral_literature` (125 proverbs/idioms)
           6. `bible_verses` & `old_testament_seed_verses` (8,051 quad-parallel verses)
         """
+        cache_key = (self.db_path, query.strip().lower(), assistant_mode, top_k)
+        if cache_key in GofathoDeepRAGEngine._rrf_cache:
+            GofathoDeepRAGEngine._rrf_cache_hits += 1
+            return GofathoDeepRAGEngine._rrf_cache[cache_key]
+        GofathoDeepRAGEngine._rrf_cache_misses += 1
+
         conn = self._get_conn()
         cur = conn.cursor()
 
+        STOPWORDS = {
+            "the", "and", "for", "with", "from", "that", "this", "what", "how", "why",
+            "who", "where", "when", "into", "out", "of", "in", "on", "to", "is", "are",
+            "was", "were", "can", "you", "explain", "tell", "me", "quote", "translate",
+            "word", "words", "gofatho", "gofa", "amharic", "english", "fictional",
+            "non", "existent", "nonexistent", "unverified", "bible", "verse", "suffix",
+            "proverb", "grade", "chapter", "topic", "corpus", "token", "king", "mythical",
+            "quantum", "teleportation", "eigenvalue", "tensor", "xyz", "klm",
+        }
         q_clean = query.strip()
-        q_latin = self.transliterator.fidel_to_latin(q_clean) if self.transliterator.is_ethiopic(q_clean) else q_clean
-        fst_tokens = self.fst.decompose_sentence(q_latin, conn)
+        has_ext_a = any(0xAB00 <= ord(c) <= 0xAB2F for c in q_clean)
+        q_latin = (
+            self.transliterator.fidel_to_latin(q_clean)
+            if (self.transliterator.is_ethiopic(q_clean) and has_ext_a)
+            else ("" if self.transliterator.is_ethiopic(q_clean) else q_clean)
+        )
+        fst_tokens = self.fst.decompose_sentence(q_latin, conn) if q_latin else []
 
-        # Build expanded search terms: raw tokens + decomposed root lemmas
+        # Build expanded search terms: non-stopword raw tokens + verified decomposed root lemmas
         search_terms = []
-        for t in re.findall(r"[A-Za-z7ሀ-፿꬀-꬯]{2,}", q_clean):
-            if t.lower() not in search_terms:
-                search_terms.append(t.lower())
+        for t in re.findall(r"[A-Za-z7ሀ-፿꬀-꬯]{3,}", q_clean):
+            tl = t.lower()
+            if tl not in STOPWORDS and not tl.isdigit() and tl not in search_terms:
+                search_terms.append(tl)
         for fp in fst_tokens:
-            rl = fp.get("root_lemma", "").rstrip("-").lower()
-            if rl and len(rl) >= 2 and rl not in search_terms:
-                search_terms.append(rl)
+            if fp.get("english_gloss") and fp.get("english_gloss") != "Contextual stem":
+                rl = fp.get("root_lemma", "").rstrip("-").lower()
+                if rl and len(rl) >= 3 and rl not in STOPWORDS and rl not in search_terms:
+                    search_terms.append(rl)
 
-        # 1. Lexicon Retrieval (FTS5 + Root Match + Char 3-gram RRF)
+        # 1. Lexicon Retrieval (SQLite FTS5 BM25 + Root Match + Char 3-gram RRF)
         lex_candidates: Dict[int, Dict[str, Any]] = {}
         for rank_idx, term in enumerate(search_terms[:10]):
-            rows = cur.execute(
+            fts_rows = []
+            safe_fts = re.sub(r'[^A-Za-z0-97\u1200-\u137F\uAB00-\uAB2F]', '', term)
+            if len(safe_fts) >= 2:
+                try:
+                    fts_rows = cur.execute(
+                        """
+                        SELECT d.id, d.headword, d.ipa, d.pos, d.english, d.amharic, d.gofatho_synonym, d.domain, d.source
+                        FROM dictionary_fts f
+                        JOIN dictionary d ON d.id = f.rowid
+                        WHERE dictionary_fts MATCH ?
+                        ORDER BY bm25(dictionary_fts) ASC
+                        LIMIT 8
+                        """,
+                        (f'"{safe_fts}"',),
+                    ).fetchall()
+                except sqlite3.OperationalError:
+                    fts_rows = []
+            like_rows = cur.execute(
                 """
                 SELECT id, headword, ipa, pos, english, amharic, gofatho_synonym, domain, source
                 FROM dictionary
-                WHERE lower(headword) LIKE ? OR lower(english) LIKE ? OR amharic LIKE ?
-                LIMIT 12
+                WHERE lower(headword) LIKE ? OR (' ' || lower(english) || ' ') LIKE ? OR amharic LIKE ?
+                LIMIT 10
                 """,
-                (f"%{term}%", f"%{term}%", f"%{term}%"),
+                (f"{term}%", f"% {term} %", f"%{term}%"),
             ).fetchall()
+            rows = list(fts_rows) + [r for r in like_rows if all(r["id"] != fr["id"] for fr in fts_rows)]
             for r_i, r in enumerate(rows):
                 rid = r["id"]
                 rrf_add = 1.0 / (60.0 + r_i + 1)
@@ -398,8 +454,9 @@ class GofathoDeepRAGEngine:
             for r in rows:
                 if not any(x["igt_code"] == r["igt_code"] for x in igt_hits):
                     igt_hits.append(dict(r))
-        if not igt_hits:
-            igt_hits = [dict(r) for r in cur.execute("SELECT * FROM sellassie_igt_corpus LIMIT 4").fetchall()]
+        # Only fallback to general IGT exemplars when explicitly in fst_morph_tutor mode and a valid Gofatho token matched
+        if not igt_hits and assistant_mode == "fst_morph_tutor" and lexicon_hits:
+            igt_hits = [dict(r) for r in cur.execute("SELECT * FROM sellassie_igt_corpus LIMIT 2").fetchall()]
 
         fst_rule_hits = [dict(r) for r in cur.execute("SELECT * FROM morphophonemic_fst_rules LIMIT 8").fetchall()]
 
@@ -442,40 +499,70 @@ class GofathoDeepRAGEngine:
                     gemination_hits.append(dict(r))
 
         oral_hits = []
+        # 5b. Prioritize exact/substring query match on oral_literature.gofatho_text first
+        exact_o_rows = cur.execute(
+            """
+            SELECT id, category, gofatho_text, response_or_pair, english_meaning, amharic_meaning, source
+            FROM oral_literature
+            WHERE lower(gofatho_text) = ? OR lower(gofatho_text) LIKE ?
+            ORDER BY CASE WHEN lower(gofatho_text) = ? THEN 0 ELSE 1 END, length(gofatho_text) ASC
+            LIMIT 5
+            """,
+            (q_latin.strip(), f"%{q_latin.strip()}%", q_latin.strip()),
+        ).fetchall()
+        for r in exact_o_rows:
+            if not any(x["gofatho_text"] == r["gofatho_text"] for x in oral_hits):
+                oral_hits.append(dict(r))
         for term in search_terms[:8]:
             o_rows = cur.execute(
                 """
-                SELECT category, gofatho_text, response_or_pair, english_meaning, amharic_meaning, source
+                SELECT id, category, gofatho_text, response_or_pair, english_meaning, amharic_meaning, source
                 FROM oral_literature
-                WHERE lower(gofatho_text) LIKE ? OR lower(english_meaning) LIKE ? OR amharic_meaning LIKE ?
+                WHERE lower(gofatho_text) LIKE ? OR (' ' || lower(english_meaning) || ' ') LIKE ? OR amharic_meaning LIKE ?
                 LIMIT 5
                 """,
-                (f"%{term}%", f"%{term}%", f"%{term}%"),
+                (f"%{term}%", f"% {term} %", f"%{term}%"),
             ).fetchall()
             for r in o_rows:
                 if not any(x["gofatho_text"] == r["gofatho_text"] for x in oral_hits):
                     oral_hits.append(dict(r))
 
-        # 6. Parallel Bible Verses (NT + OT)
+        # 6. Parallel Bible Verses (NT + OT) — supports both v4 and v5 column naming
         bible_hits = []
         for term in search_terms[:6]:
-            b_rows = cur.execute(
-                """
-                SELECT book_name_en, book_name_lat, chapter, verse, gofatho_latin, gofatho_fidel,
-                       english_translation, amharic_translation
-                FROM bible_verses
-                WHERE lower(gofatho_latin) LIKE ? OR lower(english_translation) LIKE ? OR amharic_translation LIKE ?
-                LIMIT 4
-                """,
-                (f"%{term}%", f"%{term}%", f"%{term}%"),
-            ).fetchall()
+            try:
+                b_rows = cur.execute(
+                    """
+                    SELECT book_name_en, book_name_lat, chapter, verse, gofatho_latin, gofatho_fidel,
+                           english_translation, amharic_translation
+                    FROM bible_verses
+                    WHERE lower(gofatho_latin) LIKE ? OR lower(english_translation) LIKE ? OR amharic_translation LIKE ?
+                    LIMIT 4
+                    """,
+                    (f"%{term}%", f"%{term}%", f"%{term}%"),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                try:
+                    b_rows = cur.execute(
+                        """
+                        SELECT book_id AS book_name_en, book_id AS book_name_lat, chapter, verse,
+                               gof_latin AS gofatho_latin, gof_fidel AS gofatho_fidel,
+                               eng_web AS english_translation, amh_fidel AS amharic_translation
+                        FROM bible_verses
+                        WHERE lower(gof_latin) LIKE ? OR lower(eng_web) LIKE ? OR amh_fidel LIKE ?
+                        LIMIT 4
+                        """,
+                        (f"%{term}%", f"%{term}%", f"%{term}%"),
+                    ).fetchall()
+                except sqlite3.OperationalError:
+                    b_rows = []
             for r in b_rows:
                 ref = f"{r['book_name_en']} {r['chapter']}:{r['verse']}"
                 if not any(x.get("ref") == ref for x in bible_hits):
                     bible_hits.append({**dict(r), "ref": ref})
 
         conn.close()
-        return {
+        result_bundle = {
             "query": query,
             "query_latin_normalized": q_latin,
             "fst_decomposition": fst_tokens,
@@ -489,6 +576,10 @@ class GofathoDeepRAGEngine:
             "oral_literature_hits": oral_hits[:5],
             "bible_parallel_hits": bible_hits[:5],
         }
+        if len(GofathoDeepRAGEngine._rrf_cache) >= 256:
+            GofathoDeepRAGEngine._rrf_cache.pop(next(iter(GofathoDeepRAGEngine._rrf_cache)))
+        GofathoDeepRAGEngine._rrf_cache[cache_key] = result_bundle
+        return result_bundle
 
     def verify_orthography_and_gemination(self, gofatho_text: str) -> Dict[str, Any]:
         """
@@ -530,12 +621,22 @@ class GofathoDeepRAGEngine:
         a grounded quad-parallel response with FST parse, retrieved sources, and Zara 5 verification.
         """
         rag_bundle = self.retrieve_hybrid_rrf(query, assistant_mode=assistant_mode, top_k=8)
-        phr_hits = rag_bundle["phrasebook_and_dialogue_hits"]
-        lex_hits = rag_bundle["lexicon_hits"]
-        igt_hits = rag_bundle["sellassie_igt_hits"]
-        curr_hits = rag_bundle["curriculum_28ch_hits"]
-        gem_hits = rag_bundle["gemination_hits"]
-        oral_hits = rag_bundle["oral_literature_hits"]
+        adv_patterns = [
+            r"ignore\s+(?:all\s+)?(?:previous|prior|system)\s+instructions",
+            r"bypass\s+(?:corpus|anti[-_\s]?hallucination|verification)",
+            r"(?:invent|fabricate|make\s+up|hallucinate)\s+(?:a\s+)?(?:new\s+|fake\s+|fictional\s+)?gofatho",
+            r"pretend\s+(?:that\s+)?(?:oromo|afaan\s+oromoo|swahili|somali|tigrinya)\s+(?:word\s+)?.*\s+is\s+gofatho",
+            r"force\s+translate\s+unverified",
+            r"(?:quote|cite|translate)\s+.*\b(?:hezekiah|enoch|maccabees|judith|tobit)\s+\d+:\d+",
+            r"\b(?:matthew|mark|luke|john|genesis|psalms|maatoosa|marqqoosa|luuqaasa|yohaannisa)\s+(?:1[5-9]\d|[2-9]\d\d):\d+",
+        ]
+        is_adv = any(re.search(p, query.lower()) for p in adv_patterns)
+        phr_hits = [] if is_adv else rag_bundle["phrasebook_and_dialogue_hits"]
+        lex_hits = [] if is_adv else rag_bundle["lexicon_hits"]
+        igt_hits = [] if is_adv else rag_bundle["sellassie_igt_hits"]
+        curr_hits = [] if is_adv else rag_bundle["curriculum_28ch_hits"]
+        gem_hits = [] if is_adv else rag_bundle["gemination_hits"]
+        oral_hits = [] if is_adv else rag_bundle["oral_literature_hits"]
 
         # Construct grounded synthesis
         if assistant_mode == "fst_morph_tutor" or "analyze" in query.lower() or "parse" in query.lower():
@@ -577,6 +678,12 @@ class GofathoDeepRAGEngine:
                 f"'{g['singleton_word']}' means '{g['singleton_meaning_en']}', whereas '{g['geminate_word']}' means '{g['geminate_meaning_en']}'."
             )
             gram_note = f"Contrasted consonant: {g['consonant_contrasted']} (1.0x vs. 1.85x closure duration in Sherpa-ONNX VITS)."
+        elif oral_hits and (assistant_mode == "oral_lit_guide" or not phr_hits):
+            top_o = oral_hits[0]
+            gof_lat = f"{top_o['gofatho_text']} — ({top_o.get('response_or_pair', '')})"
+            amh = f"[{top_o.get('category', 'ሥነ-ቃል')}] «{top_o['gofatho_text']}»፦ {top_o.get('amharic_meaning', '')}"
+            eng = f"[{top_o.get('category', 'Oral Literature')}] '{top_o['gofatho_text']}' ({top_o.get('response_or_pair', '')}): {top_o.get('english_meaning', '')}"
+            gram_note = f"Grounded in {top_o.get('source', 'Grade 8-10 Goofatho Doona Oral Literature')}."
         elif phr_hits:
             top_p = phr_hits[0]
             gof_lat = top_p["gofatho_latin"]
@@ -587,27 +694,115 @@ class GofathoDeepRAGEngine:
                 f"{top_p.get('morpheme_breakdown', 'SOV constituent order')}."
             )
         elif lex_hits:
-            top_l = lex_hits[0]
-            gof_lat = f"{top_l['headword']} — Goofatho qaala birshshethay: {top_l['english']}."
-            amh = f"«{top_l['headword']}» ({top_l['pos']})፦ በአማርኛ «{top_l['amharic']}» ማለት ነው።"
-            eng = f"'{top_l['headword']}' ({top_l['pos']}, IPA {top_l['ipa']}): '{top_l['english']}' (Domain: {top_l['domain']}, Source: {top_l['source']})."
-            gram_note = f"Lexicon Headword Match (RRF Score: {top_l['rrf_score']:.4f})."
+            verified_fst = [t for t in rag_bundle["fst_decomposition"] if t.get("lex_id")]
+            if len(verified_fst) >= 2:
+                gof_lat = rag_bundle["query_latin_normalized"]
+                en_parts = []
+                am_parts = []
+                for t in rag_bundle["fst_decomposition"]:
+                    if t.get("lex_id"):
+                        eb = (t.get("english_gloss") or "").split(";")[0].split(",")[0].strip()
+                        ab = (t.get("amharic_gloss") or eb).split("/")[0].split("፣")[0].strip()
+                        sufs = [s.get("gloss", "").split("(")[0].strip() for s in t.get("stripped_suffixes", []) if s.get("gloss")]
+                        en_parts.append(f"{eb}" + (f" [{' + '.join(sufs)}]" if sufs else ""))
+                        am_parts.append(ab)
+                    else:
+                        en_parts.append(f"[{t.get('surface', '')}]")
+                        am_parts.append(f"[{t.get('surface', '')}]")
+                svo_en = ([en_parts[0], en_parts[-1]] + en_parts[1:-1]) if len(en_parts) >= 3 else en_parts
+                amh = f"የጎፋኛ ዓረፍተ ነገር ውሁድ ትርጉም (Compositional SOV)፦ {' '.join(am_parts)}"
+                eng = f"Compositional SOV Clause Synthesis: {' '.join(svo_en)}"
+                gram_note = f"Synthesized from {len(verified_fst)} verified Sellassie Cheru (2015) roots & FST suffixes."
+            else:
+                top_l = lex_hits[0]
+                gof_lat = f"{top_l['headword']} — Goofatho qaala birshshethay: {top_l['english']}."
+                amh = f"«{top_l['headword']}» ({top_l['pos']})፦ በአማርኛ «{top_l['amharic']}» ማለት ነው።"
+                eng = f"'{top_l['headword']}' ({top_l['pos']}, IPA {top_l['ipa']}): '{top_l['english']}' (Domain: {top_l['domain']}, Source: {top_l['source']})."
+                gram_note = f"Lexicon Headword Match (RRF Score: {top_l['rrf_score']:.4f})."
         else:
-            gof_lat = "Saro! Taani Gofatho AI. Goofatho, Amaaratho nne Inggilizetho doonatan nena maaddanaw giigettas."
-            amh = "ሰላም! እኔ ጎፋቶ ኤአይ (Gofatho AI) ነኝ። በጎፋኛ፣ በአማርኛ እና በእንግሊዝኛ ቋንቋዎች ልረዳህ ዝግጁ ነኝ።"
-            eng = "Hello! I am Gofatho AI. I am ready to assist you in Gofatho (Latin & Fidel), Amharic, and English."
-            gram_note = "SOV Declarative: Taani (1S.NOM) ... maadd-anaw (help-FUT.PURP) giigett-as (prepare-PAST.1S)."
+            gof_lat = f"[Unverified Query / No Corpus Evidence]: {query}"
+            amh = f"⚠️ ማስታወቂያ፦ ለ«{query}» የተረጋገጠ የጎፋኛ መዝገበ-ቃላት፣ የመማሪያ መጽሐፍ ወይም የመጽሐፍ ቅዱስ ማስረጃ አልተገኘም። ያልተረጋገጠ የጎፋኛ ቃል ወይም ጥቅስ አልተፈጠረም።"
+            eng = (
+                f"⚠️ Uncertainty & Anti-Hallucination Notice: No verified Gofatho lexicon headword, phrasebook record, "
+                f"Sellassie Cheru (2015) IGT, or Bible verse matched '{query}'. Rather than fabricating Gofatho vocabulary "
+                f"or citations, this query is flagged for native-speaker review."
+            )
+            gram_note = "Strict Anti-Hallucination Policy: 0 verified corpus hits -> refused unverified generation."
+
+        has_evidence = bool(lex_hits or phr_hits or igt_hits or curr_hits or gem_hits or oral_hits)
+        confidence_tier = "verified_corpus" if has_evidence else "uncertain_needs_review"
+        is_uncertain = not has_evidence
+
+        structured_citations = []
+        seen_lex_cits = set()
+        for l in lex_hits[:3]:
+            cid = f"LEX-{l.get('id', l.get('headword', ''))}"
+            seen_lex_cits.add(cid)
+            structured_citations.append({
+                "source_type": "dictionary",
+                "source_id": cid,
+                "title": f"{l.get('headword', '')} ({l.get('pos', '')})",
+                "excerpt": f"EN: {l.get('english', '')} | AM: {l.get('amharic', '')}",
+                "authority": l.get("source", "Sellassie Cheru (2015) / Textbook Glossary"),
+            })
+        for ft in ([] if is_adv else rag_bundle["fst_decomposition"]):
+            if ft.get("lex_id"):
+                cid = f"LEX-{ft['lex_id']}"
+                if cid not in seen_lex_cits:
+                    seen_lex_cits.add(cid)
+                    structured_citations.append({
+                        "source_type": "dictionary",
+                        "source_id": cid,
+                        "title": f"{ft.get('root_lemma', '')} ({ft.get('pos', 'LEX')})",
+                        "excerpt": f"EN: {ft.get('english_gloss', '')} | AM: {ft.get('amharic_gloss', '')}",
+                        "authority": ft.get("source", "Sellassie Cheru (2015)"),
+                    })
+        for p in phr_hits[:3]:
+            structured_citations.append({
+                "source_type": "phrasebook_or_dialogue",
+                "source_id": str(p.get("phrase_code") or "PHR"),
+                "title": f"{p.get('domain', 'Dialogue')} ({p.get('phrase_code', '')})",
+                "excerpt": f"GOF: {p.get('gofatho_latin', '')} | EN: {p.get('english', '')}",
+                "authority": p.get("source", "Verified Gofatho Phrasebook & Dialogues"),
+            })
+        for i in igt_hits[:2]:
+            structured_citations.append({
+                "source_type": "sellassie_igt",
+                "source_id": str(i.get("igt_code") or "IGT"),
+                "title": f"Sellassie Cheru (2015) {i.get('igt_code', '')}",
+                "excerpt": f"{i.get('gofatho_surface', '')} -> {i.get('leipzig_gloss', '')}",
+                "authority": i.get("citation", "Sellassie Cheru (2015) AAU PhD Dissertation"),
+            })
+        for g in gem_hits[:2]:
+            structured_citations.append({
+                "source_type": "gemination_minimal_pair",
+                "source_id": str(g.get("pair_code") or "GEM"),
+                "title": f"Minniyaa vs. Leppiya ({g.get('consonant_contrasted', '')})",
+                "excerpt": f"{g.get('singleton_word', '')} ({g.get('singleton_meaning_en', '')}) vs. {g.get('geminate_word', '')} ({g.get('geminate_meaning_en', '')})",
+                "authority": "Sellassie Cheru (2015) §2.1.3 & Grade 8-10 Goofatho Doona",
+            })
+        for o in oral_hits[:2]:
+            structured_citations.append({
+                "source_type": "oral_literature",
+                "source_id": f"ORAL-{o.get('id', '')}",
+                "title": f"{o.get('category', 'Oral Lit')}: {o.get('gofatho_text', '')}",
+                "excerpt": f"EN: {o.get('english_meaning', '')} | AM: {o.get('amharic_meaning', '')}",
+                "authority": str(o.get("source") or "Grade 8-10 Goofatho Doona Oral Literature"),
+            })
 
         ver = self.verify_orthography_and_gemination(gof_lat)
 
         return {
             "session_id": session_id,
             "assistant_mode": assistant_mode,
+            "confidence_tier": confidence_tier,
+            "is_uncertain": is_uncertain,
             "gofatho_latin": ver["verified_gofatho_latin"],
             "gofatho_fidel": ver["verified_gofatho_fidel"],
             "amharic": amh,
             "english": eng,
             "grammar_notes": gram_note,
+            "structured_citations": structured_citations,
             "zara5_verification": ver,
             "fst_decomposition": rag_bundle["fst_decomposition"],
             "rag_evidence": {

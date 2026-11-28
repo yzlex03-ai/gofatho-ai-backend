@@ -9,25 +9,35 @@ Production FastAPI Backend supporting both:
 
 import os
 import re
+import hmac
+import time
 import json
 import sqlite3
 import urllib.request
 import urllib.error
+from collections import defaultdict, deque
 from typing import List, Optional, Dict, Any
-from fastapi import FastAPI, Query, HTTPException, Header
+from fastapi import FastAPI, Query, HTTPException, Header, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 
 from morphological_analyzer import GofathoMorphologicalAnalyzer, GofathoScriptTransliterator
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_CANDIDATES = [
-    os.environ.get("GOFATHO_DB_PATH", ""),
-    os.path.join(BASE_DIR, "../data/gofatho_ai_master.sqlite"),
-    os.path.join(BASE_DIR, "../flutter_app/assets/gofatho_ai_master.sqlite"),
-    "/working_dir/c_83055bf834ae5542/artifacts/file_generation/ttl=63d/intermediate/gofatho_ai_master.sqlite",
-]
-DB_PATH = next((p for p in DB_CANDIDATES if p and os.path.exists(p)), DB_CANDIDATES[1])
+
+
+def resolve_db_path() -> str:
+    candidates = [
+        os.environ.get("GOFATHO_DB_PATH", ""),
+        os.path.join(BASE_DIR, "../data/gofatho_ai_master.sqlite"),
+        os.path.join(BASE_DIR, "../flutter_app/assets/gofatho_ai_master.sqlite"),
+        "/tmp/gofatho_test_fixture.sqlite",
+    ]
+    return next((p for p in candidates if p and os.path.exists(p)), candidates[1])
+
+
+DB_PATH = resolve_db_path()
 
 analyzer = GofathoMorphologicalAnalyzer(DB_PATH)
 transliterator = GofathoScriptTransliterator()
@@ -40,20 +50,136 @@ app = FastAPI(
         "7,931 Quad-Parallel Bible Verses, 22,017 Audio Slices), Google Gemini 2.5 Flash, "
         "NLLB-200 LoRA, and Meta MMS-ASR/TTS."
     ),
-    version="5.0.0",
+    version="6.2.2",
 )
+
+_raw_origins = os.environ.get(
+    "ALLOWED_ORIGINS",
+    "https://gofatho-ai-backend-1.onrender.com,http://localhost:7860,http://127.0.0.1:7860,http://10.0.2.2:7860",
+)
+ALLOWED_ORIGINS = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+_allow_wildcard = ALLOWED_ORIGINS == ["*"]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=not _allow_wildcard,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "X-Admin-Api-Key", "X-Gemini-Api-Key"],
 )
+
+# ---------------------------------------------------------------------------
+# Security: Constant-Time Admin API Key Verification & Token-Bucket Rate Limiter
+# ---------------------------------------------------------------------------
+_admin_api_key_header = APIKeyHeader(name="X-Admin-Api-Key", auto_error=False)
+
+
+def verify_admin_api_key(
+    x_admin_api_key: Optional[str] = Depends(_admin_api_key_header),
+    authorization: Optional[str] = Header(None),
+) -> str:
+    configured_key = os.environ.get("GOFATHO_ADMIN_API_KEY", "").strip()
+    if not configured_key:
+        raise HTTPException(
+            status_code=503,
+            detail="Admin moderation endpoints are disabled until GOFATHO_ADMIN_API_KEY is configured.",
+        )
+    candidate = (x_admin_api_key or "").strip()
+    if not candidate and authorization and authorization.lower().startswith("bearer "):
+        candidate = authorization[7:].strip()
+    if not candidate or not hmac.compare_digest(candidate.encode("utf-8"), configured_key.encode("utf-8")):
+        raise HTTPException(status_code=401, detail="Invalid or missing X-Admin-Api-Key header.")
+    return "admin_verified"
+
+
+class InMemoryRateLimiter:
+    def __init__(self) -> None:
+        self._hits: Dict[str, deque] = defaultdict(deque)
+
+    def reset(self) -> None:
+        self._hits.clear()
+
+    def check(self, client_key: str) -> None:
+        max_req = int(os.environ.get("GOFATHO_RATE_LIMIT_PER_MIN", "60"))
+        now = time.monotonic()
+        window = 60.0
+        q = self._hits[client_key]
+        while q and (now - q[0]) > window:
+            q.popleft()
+        if len(q) >= max_req:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Rate limit exceeded ({max_req} requests/minute). Please retry shortly.",
+            )
+        q.append(now)
+
+
+rate_limiter = InMemoryRateLimiter()
+
+class ServerObservabilityTracker:
+    """Tracks request counts, latency percentiles (avg/P95), and RAG LRU cache metrics (Phase E.2)."""
+
+    def __init__(self, max_cache_entries: int = 256) -> None:
+        self.start_monotonic = time.monotonic()
+        self.total_requests: int = 0
+        self.route_counts: Dict[str, int] = defaultdict(int)
+        self.recent_latencies_ms: deque = deque(maxlen=500)
+        self.rag_cache: Dict[Any, Dict[str, Any]] = {}
+        self.max_cache_entries = max_cache_entries
+        self.rag_cache_hits: int = 0
+        self.rag_cache_misses: int = 0
+
+    def reset_cache(self) -> None:
+        self.rag_cache.clear()
+        self.rag_cache_hits = 0
+        self.rag_cache_misses = 0
+
+    def record_request(self, path: str, elapsed_ms: float) -> None:
+        self.total_requests += 1
+        self.route_counts[path] += 1
+        self.recent_latencies_ms.append(round(elapsed_ms, 3))
+
+    def snapshot(self) -> Dict[str, Any]:
+        lats = sorted(self.recent_latencies_ms)
+        avg_ms = round(sum(lats) / len(lats), 3) if lats else 0.0
+        p95_idx = min(len(lats) - 1, int(len(lats) * 0.95)) if lats else 0
+        p95_ms = lats[p95_idx] if lats else 0.0
+        total_cache_ops = self.rag_cache_hits + self.rag_cache_misses
+        hit_rate = round((self.rag_cache_hits / total_cache_ops) * 100.0, 2) if total_cache_ops > 0 else 0.0
+        return {
+            "uptime_sec": round(time.monotonic() - self.start_monotonic, 2),
+            "total_requests": self.total_requests,
+            "avg_latency_ms": avg_ms,
+            "p95_latency_ms": p95_ms,
+            "rag_cache_entries": len(self.rag_cache),
+            "rag_cache_hits": self.rag_cache_hits,
+            "rag_cache_misses": self.rag_cache_misses,
+            "rag_cache_hit_rate_pct": hit_rate,
+        }
+
+
+observability = ServerObservabilityTracker()
+
+
+@app.middleware("http")
+async def observability_timing_middleware(request: Request, call_next):
+    t0 = time.perf_counter()
+    response = await call_next(request)
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    observability.record_request(request.url.path, elapsed_ms)
+    response.headers["X-Process-Time-Ms"] = f"{elapsed_ms:.3f}"
+    return response
+
+
+
+def enforce_rate_limit(request: Request) -> None:
+    client_host = (request.client.host if request.client else "anonymous") or "anonymous"
+    rate_limiter.check(f"{client_host}:{request.url.path}")
 
 
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
+    active_path = os.environ.get("GOFATHO_DB_PATH", "").strip() or DB_PATH
+    conn = sqlite3.connect(active_path)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -100,28 +226,74 @@ Always return a valid JSON object with these exact keys:
 """
 
 
+
+ADVERSARIAL_OR_FABRICATION_PATTERNS = [
+    r"ignore\s+(?:all\s+)?(?:previous|prior|system)\s+instructions",
+    r"bypass\s+(?:corpus|anti[-_\s]?hallucination|verification)",
+    r"(?:invent|fabricate|make\s+up|hallucinate)\s+(?:a\s+)?(?:new\s+|fake\s+|fictional\s+)?gofatho",
+    r"pretend\s+(?:that\s+)?(?:oromo|afaan\s+oromoo|swahili|somali|tigrinya)\s+(?:word\s+)?.*\s+is\s+gofatho",
+    r"force\s+translate\s+unverified",
+    r"(?:quote|cite|translate)\s+.*\b(?:hezekiah|enoch|maccabees|judith|tobit)\s+\d+:\d+",
+    r"\b(?:matthew|mark|luke|john|genesis|psalms|maatoosa|marqqoosa|luuqaasa|yohaannisa)\s+(?:1[5-9]\d|[2-9]\d\d):\d+",
+]
+
+
+def is_adversarial_or_fabrication_attempt(text: str) -> bool:
+    low = text.lower().strip()
+    for pat in ADVERSARIAL_OR_FABRICATION_PATTERNS:
+        if re.search(pat, low):
+            return True
+    return False
+
+
 def retrieve_rag_bundle(conn: sqlite3.Connection, query_text: str, top_k: int = 8) -> Dict[str, Any]:
     """
-    Searches across `dictionary` (1,334), `everyday_phrasebook` (2,072),
-    `curriculum_meeze_exercises` (1,305), and `grammar_rules` (22)
-    using both raw tokens and morphologically stripped Gofatho roots.
+    Searches across `dictionary` (1,334 + FTS5 BM25), `everyday_phrasebook` (2,072 + FTS5),
+    `curriculum_meeze_exercises` (1,305 + FTS5), and `grammar_rules`
+    using both raw tokens, morphologically stripped Gofatho roots, and an in-memory LRU cache.
     """
-    cur = conn.cursor()
     q_clean = query_text.strip()
-    if transliterator.is_ethiopic(q_clean):
+    active_db = os.environ.get("GOFATHO_DB_PATH", "").strip() or DB_PATH
+    cache_key = (active_db, q_clean.lower(), top_k)
+    if cache_key in observability.rag_cache:
+        observability.rag_cache_hits += 1
+        return observability.rag_cache[cache_key]
+    observability.rag_cache_misses += 1
+
+    cur = conn.cursor()
+    STOPWORDS = {
+        "the", "and", "for", "with", "from", "that", "this", "what", "how", "why",
+        "who", "where", "when", "into", "out", "of", "in", "on", "to", "is", "are",
+        "was", "were", "can", "you", "explain", "tell", "me", "quote", "translate",
+        "word", "words", "gofatho", "gofa", "amharic", "english", "fictional",
+        "non", "existent", "nonexistent", "unverified", "bible", "verse", "suffix",
+        "proverb", "grade", "chapter", "topic", "corpus", "token", "king", "mythical", "mars",
+    }
+    has_extended_a = any(0xAB00 <= ord(c) <= 0xAB2F for c in q_clean)
+    if transliterator.is_ethiopic(q_clean) and has_extended_a:
         q_latin = transliterator.fidel_to_latin(q_clean)
+    elif transliterator.is_ethiopic(q_clean):
+        # Standard Amharic script without Extended-A Gofatho characters: keep Ethiopic tokens for Amharic column search
+        q_latin = ""
     else:
         q_latin = q_clean
 
     raw_tokens = [
         t.lower() for t in re.findall(r"[A-Za-z7'\u1200-\u137F\uAB00-\uAB2F]+", q_clean)
-        if len(t) >= 2
+        if len(t) >= 3 and t.lower() not in STOPWORDS and not t.isdigit()
     ]
-    morph_tokens = analyzer.analyze_sentence(q_latin)
+    morph_tokens = analyzer.analyze_sentence(q_latin, conn=conn) if q_latin else []
     roots = []
     for mt in morph_tokens:
-        r = (mt.get("root") or mt.get("surface") or "").lower().strip(".,!?;:")
-        if len(r) >= 2 and r not in roots:
+        surf_low = (mt.get("surface") or "").lower().strip(".,!?;:")
+        if surf_low in STOPWORDS:
+            continue
+        # Only use stripped root if it matched the Gofatho lexicon; otherwise keep full surface token
+        if mt.get("english_gloss"):
+            r = (mt.get("root") or surf_low).lower().strip(".,!?;:")
+        else:
+            r = surf_low
+        if len(r) >= 4 and r not in STOPWORDS and not r.isdigit() and r not in roots:
             roots.append(r)
 
     search_terms = list(dict.fromkeys(roots + raw_tokens))[:10]
@@ -129,60 +301,127 @@ def retrieve_rag_bundle(conn: sqlite3.Connection, query_text: str, top_k: int = 
     # 1. Dictionary matches (1,334 entries)
     dict_hits = []
     seen_dict = set()
+    try:
+        cur.execute("SELECT 1 FROM dictionary LIMIT 1")
+    except sqlite3.OperationalError:
+        return {
+            "morphological_analysis": morph_tokens,
+            "dictionary_matches": [],
+            "phrasebook_matches": [],
+            "meeze_matches": [],
+            "grammar_rules": [],
+        }
     for term in search_terms:
-        rows = cur.execute(
-            """
-            SELECT id, headword, ipa, pos, english, amharic, gofatho_synonym, domain
-            FROM dictionary
-            WHERE lower(headword) = ? OR lower(normalized_form) = ?
-               OR lower(english) LIKE ? OR amharic LIKE ?
-               OR lower(headword) LIKE ?
-            LIMIT 4
-            """,
-            (term, term, f"%{term}%", f"%{term}%", f"{term}%"),
-        ).fetchall()
-        for r in rows:
-            if r["id"] not in seen_dict:
-                seen_dict.add(r["id"])
-                dict_hits.append(dict(r))
+        term_matched_fts = False
+        safe_fts = re.sub(r'[^A-Za-z0-97\u1200-\u137F\uAB00-\uAB2F]', '', term)
+        if len(safe_fts) >= 3:
+            try:
+                fts_rows = cur.execute(
+                    """
+                    SELECT d.id, d.headword, d.ipa, d.pos, d.english, d.amharic, d.gofatho_synonym, d.domain, d.source
+                    FROM dictionary_fts f
+                    JOIN dictionary d ON d.id = f.rowid
+                    WHERE dictionary_fts MATCH ?
+                    ORDER BY bm25(dictionary_fts) ASC
+                    LIMIT 4
+                    """,
+                    (f'"{safe_fts}"',),
+                ).fetchall()
+                for fr in fts_rows:
+                    term_matched_fts = True
+                    if fr["id"] not in seen_dict:
+                        seen_dict.add(fr["id"])
+                        dict_hits.append(dict(fr))
+            except sqlite3.OperationalError:
+                pass
+        if not term_matched_fts:
+            rows = cur.execute(
+                """
+                SELECT id, headword, ipa, pos, english, amharic, gofatho_synonym, domain, source
+                FROM dictionary
+                WHERE lower(headword) = ? OR lower(normalized_form) = ?
+                   OR lower(headword) LIKE ?
+                   OR (' ' || lower(english) || ' ') LIKE ?
+                   OR lower(english) = ?
+                   OR amharic LIKE ?
+                LIMIT 4
+                """,
+                (term, term, f"{term}%", f"% {term} %", term, f"%{term}%"),
+            ).fetchall()
+            for r in rows:
+                if r["id"] not in seen_dict:
+                    seen_dict.add(r["id"])
+                    dict_hits.append(dict(r))
         if len(dict_hits) >= top_k:
             break
 
     # 2. Everyday Phrasebook matches (2,072 entries)
     phrase_hits = []
     seen_ph = set()
-    for term in [q_clean.lower()] + search_terms[:6]:
-        rows = cur.execute(
-            """
-            SELECT id, domain, gofatho_latin, gofatho_fidel, amharic, english, morpheme_breakdown, usage_context
-            FROM everyday_phrasebook
-            WHERE lower(gofatho_latin) LIKE ? OR lower(english) LIKE ? OR amharic LIKE ?
-            LIMIT 4
-            """,
-            (f"%{term}%", f"%{term}%", f"%{term}%"),
-        ).fetchall()
-        for r in rows:
-            if r["id"] not in seen_ph:
-                seen_ph.add(r["id"])
-                phrase_hits.append(dict(r))
+    phrase_probe_terms = ([q_clean.lower()] if len(q_clean) >= 4 else []) + [t for t in search_terms[:6] if len(t) >= 4]
+    for term in phrase_probe_terms:
+        phr_matched_fts = False
+        safe_fts = re.sub(r'[^A-Za-z0-97\u1200-\u137F\uAB00-\uAB2F\s]', ' ', term).strip()
+        fts_tokens = [w for w in safe_fts.split() if len(w) >= 3]
+        if fts_tokens:
+            fts_q = " AND ".join(f'"{w}"' for w in fts_tokens[:4])
+            try:
+                fts_rows = cur.execute(
+                    """
+                    SELECT p.id, p.phrase_code, p.domain, p.gofatho_latin, p.gofatho_fidel, p.amharic, p.english, p.morpheme_breakdown, p.usage_context, p.source
+                    FROM phrasebook_fts f
+                    JOIN everyday_phrasebook p ON p.id = f.rowid
+                    WHERE phrasebook_fts MATCH ?
+                    ORDER BY bm25(phrasebook_fts) ASC
+                    LIMIT 4
+                    """,
+                    (fts_q,),
+                ).fetchall()
+                for fr in fts_rows:
+                    phr_matched_fts = True
+                    if fr["id"] not in seen_ph:
+                        seen_ph.add(fr["id"])
+                        phrase_hits.append(dict(fr))
+            except sqlite3.OperationalError:
+                pass
+        if not phr_matched_fts:
+            rows = cur.execute(
+                """
+                SELECT id, phrase_code, domain, gofatho_latin, gofatho_fidel, amharic, english, morpheme_breakdown, usage_context, source
+                FROM everyday_phrasebook
+                WHERE lower(gofatho_latin) = ?
+                   OR (' ' || lower(gofatho_latin) || ' ') LIKE ?
+                   OR (' ' || lower(english) || ' ') LIKE ?
+                   OR lower(english) = ?
+                   OR amharic LIKE ?
+                LIMIT 4
+                """,
+                (term, f"% {term} %", f"% {term} %", term, f"%{term}%"),
+            ).fetchall()
+            for r in rows:
+                if r["id"] not in seen_ph:
+                    seen_ph.add(r["id"])
+                    phrase_hits.append(dict(r))
         if len(phrase_hits) >= 6:
             break
 
     # 3. Grade 8-10 Curriculum Meeze & Cultural Notes (1,305 entries)
     meeze_hits = []
     seen_mz = set()
-    for term in [q_clean.lower()] + search_terms[:6]:
+    for term in phrase_probe_terms:
         rows = cur.execute(
             """
-            SELECT id, grade, chapter_num, chapter_title_gofatho, exercise_type,
+            SELECT id, exercise_code, grade, chapter_num, chapter_title_gofatho, exercise_type,
                    gofatho_prompt_latin, gofatho_prompt_fidel,
                    english_translation, amharic_translation, morpheme_gloss, grammar_focus
             FROM curriculum_meeze_exercises
-            WHERE lower(gofatho_prompt_latin) LIKE ? OR lower(chapter_title_gofatho) LIKE ?
-               OR lower(english_translation) LIKE ? OR amharic_translation LIKE ?
+            WHERE (' ' || lower(gofatho_prompt_latin) || ' ') LIKE ?
+               OR (' ' || lower(chapter_title_gofatho) || ' ') LIKE ?
+               OR (' ' || lower(english_translation) || ' ') LIKE ?
+               OR amharic_translation LIKE ?
             LIMIT 3
             """,
-            (f"%{term}%", f"%{term}%", f"%{term}%", f"%{term}%"),
+            (f"% {term} %", f"% {term} %", f"% {term} %", f"%{term}%"),
         ).fetchall()
         for r in rows:
             if r["id"] not in seen_mz:
@@ -201,13 +440,49 @@ def retrieve_rag_bundle(conn: sqlite3.Connection, query_text: str, top_k: int = 
     except Exception:
         pass
 
-    return {
+    bundle_out = {
         "morphological_analysis": morph_tokens,
         "dictionary_matches": dict_hits[:top_k],
         "phrasebook_matches": phrase_hits[:6],
         "meeze_matches": meeze_hits[:5],
         "grammar_rules": grammar_hits[:6],
     }
+    if len(observability.rag_cache) >= observability.max_cache_entries:
+        observability.rag_cache.pop(next(iter(observability.rag_cache)))
+    observability.rag_cache[cache_key] = bundle_out
+    return bundle_out
+
+def build_structured_citations(rag_bundle: Dict[str, Any]) -> List[Dict[str, str]]:
+    """Constructs verifiable source citations corresponding to actual retrieved SQLite records."""
+    citations: List[Dict[str, str]] = []
+    for d in rag_bundle.get("dictionary_matches", [])[:4]:
+        citations.append({
+            "source_type": "dictionary",
+            "source_id": f"LEX-{d.get('id', d.get('headword', ''))}",
+            "title": f"{d.get('headword', '')} ({d.get('pos', '')})",
+            "excerpt": f"EN: {d.get('english', '')} | AM: {d.get('amharic', '')}",
+            "authority": str(d.get("source") or "Sellassie Cheru (2015) / Grade 8-10 Glossary"),
+        })
+    for p in rag_bundle.get("phrasebook_matches", [])[:3]:
+        pid = p.get("phrase_code") or f"PHR-{p.get('id', '')}"
+        citations.append({
+            "source_type": "phrasebook",
+            "source_id": str(pid),
+            "title": f"{p.get('domain', 'Phrasebook')} ({pid})",
+            "excerpt": f"GOF: {p.get('gofatho_latin', '')} | EN: {p.get('english', '')}",
+            "authority": str(p.get("source") or "Verified Gofatho Everyday Phrasebook"),
+        })
+    for m in rag_bundle.get("meeze_matches", [])[:2]:
+        mid = m.get("exercise_code") or f"MEEZE-{m.get('id', '')}"
+        citations.append({
+            "source_type": "curriculum_meeze",
+            "source_id": str(mid),
+            "title": f"Grade {m.get('grade', '')} Ch.{m.get('chapter_num', '')}: {m.get('chapter_title_gofatho', '')}",
+            "excerpt": f"GOF: {m.get('gofatho_prompt_latin', '')} | EN: {m.get('english_translation', '')}",
+            "authority": "SNNPR Grade 8-10 Goofatho Doona Textbook",
+        })
+    return citations
+
 
 
 def call_gemini_json(
@@ -298,10 +573,8 @@ class TTSRequest(BaseModel):
 
 @app.get("/api/v1/health")
 def health_check():
-    conn = get_db()
-    cur = conn.cursor()
     counts = {}
-    for tbl in [
+    core_tables = [
         "dictionary",
         "everyday_phrasebook",
         "curriculum_meeze_exercises",
@@ -316,20 +589,48 @@ def health_check():
         "meeze_quiz_bank",
         "ometo_cognate_bridge",
         "ocr_sample_documents",
-    ]:
-        try:
-            counts[tbl] = cur.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
-        except Exception:
+        "fst_inflection_paradigm_bank",
+    ]
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        for tbl in core_tables:
+            try:
+                counts[tbl] = cur.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
+            except Exception:
+                counts[tbl] = 0
+        conn.close()
+    except Exception:
+        for tbl in core_tables:
             counts[tbl] = 0
-    conn.close()
+    db_ready = counts.get("dictionary", 0) > 0 and counts.get("everyday_phrasebook", 0) > 0
     has_env_gemini = bool(os.environ.get("GEMINI_API_KEY", "").strip())
+    has_admin_key = bool(os.environ.get("GOFATHO_ADMIN_API_KEY", "").strip())
+    fts_counts = {}
+    if db_ready:
+        try:
+            conn_fts = get_db()
+            cur_fts = conn_fts.cursor()
+            for fts_tbl in ["dictionary_fts", "phrasebook_fts", "curriculum_fts", "igt_fts"]:
+                try:
+                    fts_counts[fts_tbl] = cur_fts.execute(f"SELECT COUNT(*) FROM {fts_tbl}").fetchone()[0]
+                except Exception:
+                    fts_counts[fts_tbl] = 0
+            conn_fts.close()
+        except Exception:
+            pass
     return {
-        "status": "ok",
-        "engine": "Gofatho AI Hybrid RAG + Gemini 2.5 Native Chat + Morphological + Complete Phases 1–8 Production Server v4.0",
+        "status": "ok" if db_ready else "degraded_db_uninitialized",
+        "db_ready": db_ready,
+        "fts5_indexes_ready": fts_counts.get("dictionary_fts", 0) > 0,
+        "fts5_index_counts": fts_counts,
+        "observability": observability.snapshot(),
+        "engine": "Gofatho AI Hybrid RAG + FTS5 BM25 + Gemini 2.5 Native Chat + FST Production Server v6.2.2",
         "database_counts": counts,
         "supported_languages": ["gof_Latn", "gof_Ethi", "amh_Ethi", "eng_Latn"],
-        "gemini_rag_ready": True,
+        "gemini_rag_ready": db_ready,
         "server_has_default_gemini_key": has_env_gemini,
+        "admin_auth_configured": has_admin_key,
         "voice_models": {
             "asr": "facebook/mms-1b-all (adapter: gof-script_latin, 29-token CTC vocab)",
             "tts": "facebook/mms-tts-gof (VITS 16kHz + Fidel-to-Latin G2P wrapper)",
@@ -342,6 +643,7 @@ def health_check():
 def native_gofatho_chat(
     req: ChatRequest,
     x_gemini_api_key: Optional[str] = Header(None),
+    _rl: None = Depends(enforce_rate_limit),
 ):
     conn = get_db()
     rag_bundle = retrieve_rag_bundle(conn, req.message, top_k=8)
@@ -432,9 +734,13 @@ def native_gofatho_chat(
         amh_txt = f"ቃል፦ {d0['headword']} = {d0.get('amharic','')} ({d0.get('pos','')})"
         eng_txt = f"Lexicon Root: {d0['headword']} = {d0.get('english','')} ({d0.get('pos','')})"
     else:
-        gof_lat = "Saro! Taani Goofatho AI. Neeni oychchidoobaa Goofatho, Amaarathooynne Inggilizethoon zaarana."
-        amh_txt = "ሰላም! እኔ ጎፋቶ AI ነኝ። የጠየቁትን በጎፋኛ፣ በአማርኛ እና በእንግሊዝኛ እመልሳለሁ።"
-        eng_txt = "Hello! I am Gofatho AI. Add your free Google Gemini API key in AI Settings for open-ended generative conversations grounded in the Gofatho database."
+        gof_lat = f"[Unverified / Out-of-Corpus Query]: {req.message}"
+        amh_txt = f"⚠️ ማስታወቂያ፦ ለ«{req.message}» የተረጋገጠ የጎፋኛ መዝገበ-ቃላት ወይም የመማሪያ መጽሐፍ ማስረጃ አልተገኘም። ያልተረጋገጠ ቃል ከመፍጠር ይልቅ ለጎፋኛ ተናጋሪዎች ግምገማ ተመዝግቧል።"
+        eng_txt = (
+            f"⚠️ Uncertainty & Anti-Hallucination Notice: No verified Gofatho dictionary entry, phrasebook record, "
+            f"or Grade 8–10 textbook passage matched '{req.message}'. To prevent hallucinated Gofatho vocabulary or "
+            f"fabricated citations, no unverified answer was generated."
+        )
 
     morph_summary = []
     for mt in rag_bundle["morphological_analysis"][:6]:
@@ -444,12 +750,39 @@ def native_gofatho_chat(
         elif mt.get("english_gloss"):
             morph_summary.append(f"{mt['surface']} ('{mt['english_gloss']}')")
 
+    # Check for non-existent Bible book or out-of-range chapter/verse requests
+    _valid_bible_books = {
+        "matthew", "mark", "luke", "john", "acts", "romans", "corinthians", "galatians",
+        "ephesians", "philippians", "colossians", "thessalonians", "timothy", "titus",
+        "philemon", "hebrews", "james", "peter", "jude", "revelation", "genesis", "psalms",
+        "proverbs", "isaiah", "maatoosa", "marqqoosa", "luuqaasa", "yohaannisa", "medhdhethaa",
+    }
+    _bible_ref_m = re.search(r"([A-Za-z]+)\s+(\d+):(\d+)", req.message)
+    _invalid_bible_ref = False
+    if _bible_ref_m:
+        _b_name = _bible_ref_m.group(1).lower()
+        _b_ch = int(_bible_ref_m.group(2))
+        if _b_name not in _valid_bible_books or _b_ch > 150:
+            _invalid_bible_ref = True
+
+    has_verified_hits = bool((top_m or top_p or top_d) and not _invalid_bible_ref and not is_adversarial_or_fabrication_attempt(req.message))
+    if not has_verified_hits:
+        gof_lat = f"[Unverified / Out-of-Corpus Query]: {req.message}"
+        amh_txt = f"⚠️ ማስታወቂያ፦ ለ«{req.message}» የተረጋገጠ የጎፋኛ መዝገበ-ቃላት ወይም የመማሪያ መጽሐፍ ማስረጃ አልተገኘም። ያልተረጋገጠ ቃል ከመፍጠር ይልቅ ለጎፋኛ ተናጋሪዎች ግምገማ ተመዝግቧል።"
+        eng_txt = (
+            f"⚠️ Uncertainty & Anti-Hallucination Notice: No verified Gofatho dictionary entry, phrasebook record, "
+            f"or Grade 8–10 textbook passage matched '{req.message}'. To prevent hallucinated Gofatho vocabulary or "
+            f"fabricated citations, no unverified answer was generated."
+        )
+    structured_cits = build_structured_citations(rag_bundle) if has_verified_hits else []
     grammar_note = (
         "Morphological & SOV Analysis: " + ("; ".join(morph_summary) if morph_summary else "Strict SOV clause structure.")
     )
 
     return {
-        "mode": "offline_sqlite_rag_synthesis",
+        "mode": "offline_sqlite_rag_synthesis" if has_verified_hits else "offline_unverified_refusal",
+        "confidence_tier": "verified_corpus" if has_verified_hits else "uncertain_needs_review",
+        "is_uncertain": not has_verified_hits,
         "topic": req.topic,
         "user_message": req.message,
         "gofatho_latin": gof_lat,
@@ -457,6 +790,7 @@ def native_gofatho_chat(
         "amharic": amh_txt,
         "english": eng_txt,
         "grammar_notes": grammar_note,
+        "structured_citations": structured_cits,
         "rag_citations": {
             "dictionary_count": len(rag_bundle["dictionary_matches"]),
             "phrasebook_count": len(rag_bundle["phrasebook_matches"]),
@@ -631,7 +965,24 @@ def get_chapter_audio_alignment(
 def hybrid_rag_translate(
     req: TranslateRequest,
     x_gemini_api_key: Optional[str] = Header(None),
+    _rl: None = Depends(enforce_rate_limit),
 ):
+    if is_adversarial_or_fabrication_attempt(req.text):
+        return {
+            "source_text": req.text,
+            "source_lang": req.source_lang,
+            "target_lang": req.target_lang,
+            "translation": (
+                f"⚠️ Adversarial / Fabrication Refusal: '{req.text}' requests unverified vocabulary fabrication, "
+                f"cross-language substitution, or an invalid scripture reference. Refused under Section 6.D."
+            ),
+            "confidence_tier": "uncertain_needs_review",
+            "is_uncertain": True,
+            "structured_citations": [],
+            "morphological_analysis": [],
+            "rag_examples": [],
+            "engine_mode": "adversarial_anti_hallucination_refusal",
+        }
     conn = get_db()
     cur = conn.cursor()
 
@@ -644,7 +995,7 @@ def hybrid_rag_translate(
         gof_latin_input = working_text
 
     morph_breakdown = (
-        analyzer.analyze_sentence(gof_latin_input)
+        analyzer.analyze_sentence(gof_latin_input, conn=conn)
         if req.source_lang.startswith("gof")
         else []
     )
@@ -709,6 +1060,9 @@ def hybrid_rag_translate(
             "phrasebook_exact_match": ep,
             "morphological_analysis": morph_breakdown,
             "rag_examples": rag_examples,
+            "structured_citations": build_structured_citations(rag_bundle),
+            "confidence_tier": "verified_corpus",
+            "is_uncertain": False,
             "engine_mode": "exact_phrasebook_match",
         }
 
@@ -748,57 +1102,149 @@ def hybrid_rag_translate(
                 "engine_mode": "gemini_2.5_flash_rag",
             }
 
+    structured_cits = build_structured_citations(rag_bundle)
+    confidence_tier = "verified_corpus"
+    is_uncertain = False
+    engine_mode = "offline_morphological_rag"
+
     if req.source_lang.startswith("gof") and req.target_lang == "gof_Ethi":
         final_translation = transliterator.latin_to_fidel(gof_latin_input)
+        structured_cits = structured_cits or [{
+            "source_type": "orthography_rule",
+            "source_id": "ZARA-05",
+            "title": "Goofatho Doona Dual-Script Transliterator",
+            "excerpt": "Deterministic Latin <-> Ethiopic Extended-A Fidel conversion.",
+            "authority": "Grade 9 Goofatho Doona Textbook & Sellassie Cheru (2015)",
+        }]
     elif req.source_lang == "gof_Ethi" and req.target_lang == "gof_Latn":
         final_translation = gof_latin_input
+        structured_cits = structured_cits or [{
+            "source_type": "orthography_rule",
+            "source_id": "ZARA-05",
+            "title": "Goofatho Doona Dual-Script Transliterator",
+            "excerpt": "Deterministic Ethiopic Extended-A Fidel <-> Latin conversion.",
+            "authority": "Grade 9 Goofatho Doona Textbook & Sellassie Cheru (2015)",
+        }]
     elif req.source_lang.startswith("gof"):
-        gloss_Field = "english_gloss" if req.target_lang == "eng_Latn" else "amharic_gloss"
+        gloss_field = "english_gloss" if req.target_lang == "eng_Latn" else "amharic_gloss"
         pieces = []
+        matched_any_root = False
+        existing_cit_ids = {str(c.get("source_id", "")) for c in structured_cits}
         for m in morph_breakdown:
-            g = m.get(gloss_Field)
+            g = m.get(gloss_field) or m.get("english_gloss")
             if g:
+                matched_any_root = True
                 primary_meaning = g.split(";")[0].split(",")[0].strip()
                 affix_notes = [a["function"].split("(")[0].strip() for a in m.get("affixes", [])]
                 if affix_notes:
                     pieces.append(f"{primary_meaning} [{' + '.join(affix_notes)}]")
                 else:
                     pieces.append(primary_meaning)
+                if m.get("lex_id") and f"LEX-{m['lex_id']}" not in existing_cit_ids:
+                    cid = f"LEX-{m['lex_id']}"
+                    existing_cit_ids.add(cid)
+                    structured_cits.append({
+                        "source_type": "dictionary",
+                        "source_id": cid,
+                        "title": f"{m.get('root', m['surface'])} ({m.get('pos', 'LEX')})",
+                        "excerpt": f"EN: {m.get('english_gloss', '')} | AM: {m.get('amharic_gloss', '')}",
+                        "authority": str(m.get("source") or "Sellassie Cheru (2015)"),
+                    })
             else:
-                pieces.append(m["surface"])
-        if len(pieces) >= 3 and req.target_lang == "eng_Latn":
-            reordered = [pieces[0], pieces[-1]] + pieces[1:-1]
-            final_translation = " ".join(reordered)
+                pieces.append(f"[unverified:{m['surface']}]")
+        if not matched_any_root and not rag_bundle["dictionary_matches"] and not rag_bundle["phrasebook_matches"]:
+            confidence_tier = "uncertain_needs_review"
+            is_uncertain = True
+            engine_mode = "offline_unverified_refusal"
+            final_translation = (
+                f"⚠️ Unverified in Gofatho Corpus: '{req.text}' could not be verified in the 1,349-headword "
+                f"Sellassie Cheru (2015) lexicon or Grade 8–10 Goofatho Doona textbooks. No translation was fabricated."
+            )
         else:
-            final_translation = " ".join(pieces)
+            if rag_bundle["dictionary_matches"] and len(morph_breakdown) == 1:
+                top_d = rag_bundle["dictionary_matches"][0]
+                if req.target_lang == "amh_Ethi" and top_d.get("amharic"):
+                    final_translation = top_d["amharic"]
+                elif req.target_lang == "eng_Latn" and top_d.get("english"):
+                    final_translation = top_d["english"]
+                else:
+                    final_translation = " ".join(pieces)
+            elif len(pieces) >= 3 and req.target_lang == "eng_Latn":
+                reordered = [pieces[0], pieces[-1]] + pieces[1:-1]
+                final_translation = " ".join(reordered)
+            else:
+                final_translation = " ".join(pieces)
     else:
         conn = get_db()
         cur = conn.cursor()
         gof_words = []
-        for tok in tokens:
-            row = cur.execute(
-                "SELECT headword FROM dictionary WHERE lower(english) LIKE ? OR amharic LIKE ? LIMIT 1",
-                (f"%{tok.lower()}%", f"%{tok}%"),
-            ).fetchone()
-            gof_words.append(row["headword"] if row else tok)
+        matched_count = 0
+        # First check exact or whole-query dictionary match
+        exact_dict = cur.execute(
+            "SELECT id, headword, pos, english, amharic, source FROM dictionary WHERE lower(english) = lower(?) OR amharic = ? OR lower(english) LIKE ? LIMIT 1",
+            (working_text, working_text, f"%{working_text.lower()}%"),
+        ).fetchone()
+        if exact_dict and len(tokens) <= 2:
+            matched_count = 1
+            gof_words = [exact_dict["headword"].rstrip("-")]
+            if not structured_cits:
+                structured_cits.append({
+                    "source_type": "dictionary",
+                    "source_id": f"LEX-{exact_dict['id']}",
+                    "title": f"{exact_dict['headword']} ({exact_dict['pos']})",
+                    "excerpt": f"EN: {exact_dict['english']} | AM: {exact_dict['amharic']}",
+                    "authority": str(exact_dict["source"] or "Sellassie Cheru (2015)"),
+                })
+        else:
+            for tok in tokens:
+                row = cur.execute(
+                    "SELECT id, headword, pos, english, amharic, source FROM dictionary WHERE lower(english) LIKE ? OR amharic LIKE ? LIMIT 1",
+                    (f"%{tok.lower()}%", f"%{tok}%"),
+                ).fetchone()
+                if row:
+                    matched_count += 1
+                    gof_words.append(row["headword"].rstrip("-"))
+                    if len(structured_cits) < 4:
+                        structured_cits.append({
+                            "source_type": "dictionary",
+                            "source_id": f"LEX-{row['id']}",
+                            "title": f"{row['headword']} ({row['pos']})",
+                            "excerpt": f"EN: {row['english']} | AM: {row['amharic']}",
+                            "authority": str(row["source"] or "Sellassie Cheru (2015)"),
+                        })
+                else:
+                    gof_words.append(f"[unverified:{tok}]")
         conn.close()
-        if len(gof_words) >= 3:
-            gof_words = [gof_words[0]] + gof_words[2:] + [gof_words[1]]
-        gof_out = " ".join(gof_words)
-        final_translation = (
-            transliterator.latin_to_fidel(gof_out)
-            if req.target_lang == "gof_Ethi"
-            else gof_out
-        )
+
+        if matched_count == 0:
+            confidence_tier = "uncertain_needs_review"
+            is_uncertain = True
+            engine_mode = "offline_unverified_refusal"
+            final_translation = (
+                f"⚠️ Unverified / Out-of-Vocabulary: No verified Gofatho lexical equivalent was found in the corpus for '{req.text}'. "
+                f"To prevent hallucinated Gofatho vocabulary, no unverified word was invented."
+            )
+        else:
+            if len(gof_words) >= 3:
+                gof_words = [gof_words[0]] + gof_words[2:] + [gof_words[1]]
+            gof_out = " ".join(gof_words)
+            final_translation = (
+                transliterator.latin_to_fidel(gof_out)
+                if req.target_lang == "gof_Ethi"
+                else gof_out
+            )
 
     return {
         "source_text": req.text,
         "source_lang": req.source_lang,
         "target_lang": req.target_lang,
         "translation": final_translation,
+        "confidence_tier": confidence_tier,
+        "is_uncertain": is_uncertain,
+        "structured_citations": structured_cits,
         "morphological_analysis": morph_breakdown,
         "rag_examples": rag_examples,
-        "engine_mode": "offline_morphological_rag",
+        "engine_mode": engine_mode,
     }
 
 
@@ -842,7 +1288,7 @@ def transcribe_gofatho_speech(
 
 
 @app.post("/api/v1/feedback")
-def submit_community_feedback(item: FeedbackItem):
+def submit_community_feedback(item: FeedbackItem, _rl: None = Depends(enforce_rate_limit)):
     conn = get_db()
     cur = conn.cursor()
     cur.execute(
@@ -880,6 +1326,41 @@ def submit_community_feedback(item: FeedbackItem):
             item.suggested_english,
             item.contributor_woreda,
             item.notes,
+        ),
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS translation_feedback (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_text TEXT,
+            source_lang TEXT,
+            initial_ai_output TEXT,
+            suggested_correction TEXT,
+            fidel_script TEXT,
+            woreda_dialect TEXT,
+            linguistic_note TEXT,
+            status TEXT DEFAULT 'Pending Review',
+            synced_to_cloud INTEGER DEFAULT 0,
+            upvotes INTEGER DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    cur.execute(
+        """
+        INSERT INTO translation_feedback (
+            source_text, source_lang, initial_ai_output, suggested_correction,
+            fidel_script, woreda_dialect, linguistic_note, status, synced_to_cloud, upvotes
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'Pending Review', 1, 1)
+        """,
+        (
+            item.source_text,
+            item.source_lang,
+            item.suggested_english or item.suggested_amharic or "",
+            item.suggested_gofatho_latin,
+            fidel_val,
+            item.contributor_woreda or "Sawla",
+            item.notes or "",
         ),
     )
     conn.commit()
@@ -1020,7 +1501,8 @@ def ocr_and_translate_document(
     x_gemini_api_key: Optional[str] = Header(None),
 ):
     from ocr_vision_translator import GofathoOcrVisionPipeline
-    pipeline = GofathoOcrVisionPipeline(DB_PATH)
+    active_db = os.environ.get("GOFATHO_DB_PATH", "").strip() or DB_PATH
+    pipeline = GofathoOcrVisionPipeline(active_db)
     api_key = (req.gemini_api_key or x_gemini_api_key or os.environ.get("GEMINI_API_KEY", "")).strip()
     if req.is_base64_image:
         return pipeline.ocr_and_translate_image_base64(req.ocr_text_or_base64, req.mime_type, api_key)
@@ -1131,16 +1613,37 @@ class ApproveFeedbackRequest(BaseModel):
 
 
 @app.get("/api/v1/admin/feedback_queue")
-def list_moderation_feedback_queue():
+def list_moderation_feedback_queue(_admin: str = Depends(verify_admin_api_key)):
     conn = get_db()
     cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS translation_feedback (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_text TEXT,
+            source_lang TEXT,
+            initial_ai_output TEXT,
+            suggested_correction TEXT,
+            fidel_script TEXT,
+            woreda_dialect TEXT,
+            linguistic_note TEXT,
+            status TEXT DEFAULT 'Pending Review',
+            synced_to_cloud INTEGER DEFAULT 0,
+            upvotes INTEGER DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
     rows = [dict(r) for r in cur.execute("SELECT * FROM translation_feedback ORDER BY id DESC").fetchall()]
     conn.close()
     return {"count": len(rows), "feedback_queue": rows}
 
 
 @app.post("/api/v1/admin/approve_feedback")
-def approve_and_merge_community_feedback(req: ApproveFeedbackRequest):
+def approve_and_merge_community_feedback(
+    req: ApproveFeedbackRequest,
+    _admin: str = Depends(verify_admin_api_key),
+):
     """
     Approves a native speaker correction from Gofa Zone woredas, updates its status to
     'Approved & Merged', and inserts it into `everyday_phrasebook` for immediate RAG & NLLB-200 retraining.
@@ -1182,8 +1685,18 @@ def approve_and_merge_community_feedback(req: ApproveFeedbackRequest):
             "Phase 8 Community Verification Loop",
         ),
     )
+    try:
+        cur.execute("INSERT INTO phrasebook_fts(phrasebook_fts) VALUES('rebuild')")
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
     conn.close()
+    observability.reset_cache()
+    try:
+        from gofatho_deep_rag_engine import GofathoDeepRAGEngine
+        GofathoDeepRAGEngine._rrf_cache.clear()
+    except Exception:
+        pass
     return {
         "status": "Approved & Merged into Master SQLite",
         "feedback_id": req.feedback_id,
@@ -1194,7 +1707,7 @@ def approve_and_merge_community_feedback(req: ApproveFeedbackRequest):
 
 
 @app.get("/api/v1/admin/export_retraining_jsonl")
-def export_nllb_retraining_jsonl():
+def export_nllb_retraining_jsonl(_admin: str = Depends(verify_admin_api_key)):
     """Exports approved community feedback & newly added phrases as bidirectional NLLB-200 JSONL pairs."""
     conn = get_db()
     cur = conn.cursor()
@@ -1236,6 +1749,16 @@ def export_nllb_retraining_jsonl():
 from gofatho_deep_rag_engine import GofathoDeepRAGEngine
 from gofatho_voice_assistant_pipeline import GofathoVoiceAssistantPipeline
 
+def _get_deep_rag_engine() -> GofathoDeepRAGEngine:
+    active_path = os.environ.get("GOFATHO_DB_PATH", "").strip() or DB_PATH
+    return GofathoDeepRAGEngine(active_path)
+
+
+def _get_voice_pipeline() -> GofathoVoiceAssistantPipeline:
+    active_path = os.environ.get("GOFATHO_DB_PATH", "").strip() or DB_PATH
+    return GofathoVoiceAssistantPipeline(active_path)
+
+
 deep_rag_engine = GofathoDeepRAGEngine(DB_PATH)
 voice_pipeline = GofathoVoiceAssistantPipeline(DB_PATH)
 
@@ -1256,7 +1779,7 @@ class VoiceTurnRequest(BaseModel):
 
 
 @app.post("/api/v1/chat/deep_rag")
-def chat_with_deep_hybrid_rag(req: DeepRagChatRequest):
+def chat_with_deep_hybrid_rag(req: DeepRagChatRequest, _rl: None = Depends(enforce_rate_limit)):
     """
     5-Stage Deep Morphology-Aware Hybrid RAG & Post-Editing Chat Assistant:
       Stage 1: 4-Stage FST Morphological Decomposer & Reverse MP-01..MP-11 Rules
@@ -1265,7 +1788,7 @@ def chat_with_deep_hybrid_rag(req: DeepRagChatRequest):
       Stage 4: Grounded Quad-Parallel Response Synthesis & Multi-Turn Memory
       Stage 5: Goofatho Doona 'Zara 5' Orthography & Gemination Verifier
     """
-    return deep_rag_engine.synthesize_offline_or_hybrid_response(
+    return _get_deep_rag_engine().synthesize_offline_or_hybrid_response(
         query=req.query_text,
         assistant_mode=req.assistant_mode,
         session_id=req.session_id,
@@ -1274,11 +1797,15 @@ def chat_with_deep_hybrid_rag(req: DeepRagChatRequest):
 
 @app.get("/api/v1/morph/fst_analyze")
 def analyze_sentence_with_fst(
-    text: str = Query(..., description="Gofatho sentence or word in Latin or Ethiopic Fidel script"),
+    text: Optional[str] = Query(None, description="Gofatho sentence or word in Latin or Ethiopic Fidel script"),
+    word: Optional[str] = Query(None, description="Alias for text (single word or phrase)"),
 ):
+    text = (text or word or "").strip()
+    if not text:
+        raise HTTPException(status_code=422, detail="Query parameter 'text' or 'word' is required.")
     """Decomposes every word into root lemma, stripped affixes, and Sellassie Cheru (2015) MP-01..MP-11 rules."""
     conn = get_db()
-    tokens = deep_rag_engine.fst.decompose_sentence(text, conn)
+    tokens = _get_deep_rag_engine().fst.decompose_sentence(text, conn)
     rules = [dict(r) for r in conn.execute("SELECT * FROM morphophonemic_fst_rules").fetchall()]
     conn.close()
     return {
@@ -1290,8 +1817,124 @@ def analyze_sentence_with_fst(
     }
 
 
+class AnalyzeSentenceRequest(BaseModel):
+    sentence: str = Field(..., description="Gofatho sentence in Latin or Ethiopic Extended-A Fidel script")
+
+
+def _infer_sov_constituent_role(idx: int, total: int, tok: Dict[str, Any]) -> str:
+    sufs = [s.get("suffix", "") for s in tok.get("stripped_suffixes", [])]
+    gl_str = " ".join(s.get("gloss", "") for s in tok.get("stripped_suffixes", []))
+    pos = (tok.get("pos") or "").upper()
+    if any(k in gl_str for k in ["DCL", "INTER", "IMP", "PROH", "JUSS", "OPT"]) or (idx == total - 1 and "V" in pos):
+        return "V_PREDICATE (SOV Clause-Final Finite Verb)"
+    if "CNV" in gl_str:
+        return "V_CONVERB (Medial Clause-Chaining Converb)"
+    if any(s in sufs for s in ["-ppe", "-fe", "-n", "-ra", "-s", "-w"]) or any(k in gl_str for k in ["ABL", "LOC", "DAT", "COM", "INST"]):
+        return "OBLIQUE_PP (Postpositional / Case-Marked Adjunct)"
+    if "-y" in sufs or "-t-i" in sufs or "NOM" in gl_str or (idx == 0 and ("PRON" in pos or "N" in pos)) or (idx == total - 1 and "N" in pos):
+        return "S_SUBJECT (Nominative Subject / Head NP)"
+    if idx < total - 1 and ("N" in pos or "ADJ" in pos):
+        return "O_OBJECT_OR_MODIFIER (Pre-Verbal Object / Nominal Modifier)"
+    return "CONSTITUENT_STEM"
+
+
+@app.post("/api/v1/morph/analyze_sentence")
+def analyze_interlinear_sov_sentence(req: AnalyzeSentenceRequest, _rl: None = Depends(enforce_rate_limit)):
+    """
+    Batch Interlinear Leipzig Glossing (IGT) & SOV Constituent Role Analyzer (Phase I.2):
+    Decomposes a multi-word Gofatho sentence (Latin or Ethiopic Fidel) into per-token
+    root lemmas, stripped suffixes, MP-01..MP-11 rules, SOV constituent roles,
+    4-tier interlinear gloss lines, compositional English/Amharic glosses, and LEX-* citations.
+    """
+    raw = req.sentence.strip()
+    if not raw:
+        raise HTTPException(status_code=422, detail="Field 'sentence' cannot be empty.")
+    latin_sentence = (
+        transliterator.fidel_to_latin(raw)
+        if transliterator.is_ethiopic(raw)
+        else raw
+    )
+    fidel_sentence = transliterator.latin_to_fidel(latin_sentence)
+
+    conn = get_db()
+    fst_tokens = _get_deep_rag_engine().fst.decompose_sentence(latin_sentence, conn)
+    conn.close()
+
+    total_toks = len(fst_tokens)
+    enriched_tokens = []
+    surface_tier = []
+    morpheme_tier = []
+    leipzig_tier = []
+    citations = []
+    seen_cits = set()
+    en_pieces = []
+    am_pieces = []
+
+    for idx, t in enumerate(fst_tokens):
+        role = _infer_sov_constituent_role(idx, total_toks, t)
+        sufs = t.get("stripped_suffixes", [])
+        root_clean = (t.get("root_lemma") or t.get("surface", "")).rstrip("-")
+        m_break = root_clean + ("".join(s.get("suffix", "") for s in sufs) if sufs else "")
+        en_base = (t.get("english_gloss") or "stem").split(";")[0].split(",")[0].strip()
+        am_base = (t.get("amharic_gloss") or en_base).split("/")[0].split("፣")[0].strip()
+        suf_codes = [s.get("gloss", "").split("(")[0].strip().replace(" ", ".") for s in sufs if s.get("gloss")]
+        l_gloss = en_base.replace(" ", ".") + ("-" + "-".join(suf_codes) if suf_codes else "")
+
+        surface_tier.append(t.get("surface", ""))
+        morpheme_tier.append(m_break)
+        leipzig_tier.append(l_gloss)
+
+        if t.get("lex_id"):
+            cid = f"LEX-{t['lex_id']}"
+            if cid not in seen_cits:
+                seen_cits.add(cid)
+                citations.append({
+                    "source_type": "dictionary",
+                    "source_id": cid,
+                    "title": f"{t.get('root_lemma')} ({t.get('pos', 'LEX')})",
+                    "excerpt": f"EN: {t.get('english_gloss', '')} | AM: {t.get('amharic_gloss', '')}",
+                    "authority": str(t.get("source") or "Sellassie Cheru (2015)"),
+                })
+            en_pieces.append(f"{en_base}" + (f" [{' + '.join(suf_codes)}]" if suf_codes else ""))
+            am_pieces.append(am_base)
+        else:
+            en_pieces.append(f"[{t.get('surface', '')}]")
+            am_pieces.append(f"[{t.get('surface', '')}]")
+
+        enriched_tokens.append({
+            **t,
+            "sov_role": role,
+            "morpheme_segmentation": m_break,
+            "leipzig_gloss": l_gloss,
+        })
+
+    # Reorder SOV -> SVO for compositional English gloss preview when >= 3 tokens
+    if len(en_pieces) >= 3:
+        svo_en = [en_pieces[0], en_pieces[-1]] + en_pieces[1:-1]
+    else:
+        svo_en = en_pieces
+
+    return {
+        "input_sentence": raw,
+        "gofatho_latin": latin_sentence,
+        "gofatho_fidel": fidel_sentence,
+        "token_count": total_toks,
+        "word_order_typology": "SOV (Subject-Object-Verb Head-Final North Omotic)",
+        "interlinear_tiers": {
+            "tier_1_surface_latin": "  ".join(surface_tier),
+            "tier_2_surface_fidel": fidel_sentence,
+            "tier_3_morpheme_break": "  ".join(morpheme_tier),
+            "tier_4_leipzig_gloss": "  ".join(leipzig_tier),
+        },
+        "compositional_english_gloss": " ".join(svo_en),
+        "compositional_amharic_gloss": " ".join(am_pieces),
+        "tokens": enriched_tokens,
+        "structured_citations": citations,
+    }
+
+
 @app.post("/api/v1/voice/converse")
-def converse_with_voice_assistant(req: VoiceTurnRequest):
+def converse_with_voice_assistant(req: VoiceTurnRequest, _rl: None = Depends(enforce_rate_limit)):
     """
     4-Stage End-to-End Voice Assistant Pipeline:
       Stage A: Silero VAD (16 kHz hands-free or push-to-talk endpointing)
@@ -1299,7 +1942,7 @@ def converse_with_voice_assistant(req: VoiceTurnRequest):
       Stage C: Deep Morphology-Aware Hybrid RAG Spoken Turn Generation
       Stage D: Clause-Chunked Sherpa-ONNX VITS TTS with Autosegmental Tone & Gemination Prosody
     """
-    return voice_pipeline.process_voice_turn(
+    return _get_voice_pipeline().process_voice_turn(
         raw_transcript=req.raw_transcript,
         session_id=req.session_id,
         vad_mode=req.vad_mode,
@@ -1335,9 +1978,11 @@ def list_grade8_to_10_curriculum_chapters(
 @app.get("/api/v1/fst/inflect")
 def search_pregenerated_fst_inflections(
     root_or_lemma: str = Query("", description="Verb root (e.g. oott-, b-, uy-, shamm-) or Noun lemma (e.g. boora, mishire, miidzdze)"),
+    lemma: str = Query("", description="Alias for root_or_lemma"),
     category: str = Query("", description="TAM category or Nominal Case filter"),
     limit: int = Query(50, ge=1, le=200),
 ):
+    root_or_lemma = (root_or_lemma or lemma).strip()
     """Queries the 3,480 pre-generated Forward FST verb conjugations and noun declensions (MP-01..MP-11)."""
     conn = get_db()
     cur = conn.cursor()

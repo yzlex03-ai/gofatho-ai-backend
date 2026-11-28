@@ -1,0 +1,28 @@
+{
+  "model_id": "facebook/mms-tts-gof",
+  "version": "4.0.0",
+  "language_iso": "gof",
+  "language_name": "Gofa (Goofatho)",
+  "script": "gof-script_latin + Ethiopic Fidel G2P",
+  "sample_rate_hz": 16000,
+  "tokens_file": "tokens.txt",
+  "lexicon_file": "lexicon.txt",
+  "lexicon_entries": 1185,
+  "int8_onnx_file": "model.int8.onnx",
+  "fp32_onnx_file": "model.onnx",
+  "onnxruntime_verified": true,
+  "onnxruntime_version": "1.31.0",
+  "metadata": {
+    "model_type": "vits",
+    "comment": "mms",
+    "language": "Gofa (Goofatho, ISO 639-3: gof)",
+    "voice": "gof-script_latin",
+    "has_espeak": "0",
+    "sample_rate": "16000",
+    "n_speakers": "1",
+    "add_blank": "1",
+    "pad_id": "0",
+    "glottal_stop_token": "7",
+    "gemination_support": "minniyaa_1.85x_leppiya_1.0x"
+  }
+}

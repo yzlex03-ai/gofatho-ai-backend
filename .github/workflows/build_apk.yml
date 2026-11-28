@@ -1,0 +1,99 @@
+name: Build Gofatho AI Android APK & Google Play AAB
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+    inputs:
+      release_channel:
+        description: 'Release channel (beta-apk or play-store-aab)'
+        required: false
+        default: 'both'
+
+jobs:
+  build-android:
+    name: Cloud Compile Flutter APK & Play Store AAB
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: 1. Checkout Gofatho AI Repository
+        uses: actions/checkout@v4
+
+      - name: 2. Set up JDK 17 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: 3. Set up Flutter 3.24 Stable
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.24.3'
+          channel: 'stable'
+          cache: true
+
+      - name: 4. Verify Bundled Offline SQLite Database (gofatho_ai_master.sqlite)
+        run: |
+          if [ -f "data/gofatho_ai_master.sqlite" ]; then
+            cp -f data/gofatho_ai_master.sqlite flutter_app/assets/gofatho_ai_master.sqlite
+          fi
+          ls -lh flutter_app/assets/gofatho_ai_master.sqlite
+
+      - name: 5. Configure Optional Release Keystore (Fallback to Debug Signing if Unset)
+        working-directory: flutter_app/android
+        env:
+          KEYSTORE_BASE64: ${{ secrets.GOFATHO_KEYSTORE_BASE64 }}
+          KEY_ALIAS: ${{ secrets.GOFATHO_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.GOFATHO_KEY_PASSWORD }}
+          STORE_PASSWORD: ${{ secrets.GOFATHO_STORE_PASSWORD }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 --decode > app/gofatho-release-key.jks
+            cat <<EOF > key.properties
+          storePassword=$STORE_PASSWORD
+          keyPassword=$KEY_PASSWORD
+          keyAlias=$KEY_ALIAS
+          storeFile=gofatho-release-key.jks
+          EOF
+            echo "Configured production release signing keystore."
+          else
+            echo "No GOFATHO_KEYSTORE_BASE64 secret found; using automatic debug-signed release APK for instant installation."
+          fi
+
+      - name: 6. Install Flutter Dependencies & Run Static Analysis + Unit Tests
+        working-directory: flutter_app
+        run: |
+          flutter pub get
+          flutter analyze --no-fatal-infos
+          flutter test
+
+      - name: 7. Build Universal & Split-ABI Android Release APKs (.apk)
+        working-directory: flutter_app
+        run: |
+          flutter build apk --release
+          flutter build apk --split-per-abi --release
+
+      - name: 8. Build Signed Google Play Store App Bundle (.aab)
+        working-directory: flutter_app
+        run: |
+          flutter build appbundle --release
+
+      - name: 9. Upload Installable Android APKs (Universal + arm64-v8a + armeabi-v7a)
+        uses: actions/upload-artifact@v4
+        with:
+          name: Gofatho-AI-Android-APKs-v6.2.2
+          path: |
+            flutter_app/build/app/outputs/flutter-apk/app-release.apk
+            flutter_app/build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
+            flutter_app/build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk
+          retention-days: 90
+
+      - name: 10. Upload Google Play Store Bundle (.aab)
+        uses: actions/upload-artifact@v4
+        with:
+          name: Gofatho-AI-GooglePlay-AAB-v6.2.2
+          path: flutter_app/build/app/outputs/bundle/release/app-release.aab
+          retention-days: 90

@@ -66,17 +66,20 @@ class GofathoVoiceAssistantPipeline:
         self._load_lexicon_hotwords()
 
     def _load_lexicon_hotwords(self) -> None:
-        conn = sqlite3.connect(self.db_path)
-        cur = conn.cursor()
         words = set()
-        for (hw,) in cur.execute("SELECT headword FROM dictionary").fetchall():
-            w = hw.strip().rstrip("-").lower()
-            if len(w) >= 2:
-                words.add(w)
-        for (phr,) in cur.execute("SELECT gofatho_latin FROM everyday_phrasebook LIMIT 600").fetchall():
-            for tok in re.findall(r"[A-Za-z7]{2,}", phr):
-                words.add(tok.lower())
-        conn.close()
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cur = conn.cursor()
+            for (hw,) in cur.execute("SELECT headword FROM dictionary").fetchall():
+                w = hw.strip().rstrip("-").lower()
+                if len(w) >= 2:
+                    words.add(w)
+            for (phr,) in cur.execute("SELECT gofatho_latin FROM everyday_phrasebook LIMIT 600").fetchall():
+                for tok in re.findall(r"[A-Za-z7]{2,}", phr):
+                    words.add(tok.lower())
+            conn.close()
+        except sqlite3.OperationalError:
+            pass
         lex_v6_p = os.path.join(self.onnx_dir, "lexicon_v6_expanded.txt")
         if os.path.exists(lex_v6_p):
             with open(lex_v6_p, encoding="utf-8") as lf:
@@ -95,34 +98,63 @@ class GofathoVoiceAssistantPipeline:
         rescored_tokens = []
         corrections = []
 
+        # High-frequency glottal-dropped / degeminated CTC tokens -> canonical Gofatho restoration map
+        GLOTTAL_GEMINATE_HOTWORDS = {
+            "loo": "lo77o",
+            "lo7o": "lo77o",
+            "naa": "na7a",
+            "baa": "ba7a",
+            "saa": "sa7a",
+            "peadii": "pe7adii",
+            "dubusha": "dubbusha",
+            "keeta": "keetta",
+            "goofato": "goofatho",
+        }
+        conn_tmp = None
+        try:
+            conn_tmp = sqlite3.connect(self.db_path)
+        except sqlite3.OperationalError:
+            conn_tmp = None
+
         for tok in tokens:
             if not re.match(r"^[A-Za-z7']+$", tok):
                 rescored_tokens.append(tok)
                 continue
             low = tok.lower().replace("'", "7")
+            if low in GLOTTAL_GEMINATE_HOTWORDS:
+                restored = GLOTTAL_GEMINATE_HOTWORDS[low]
+                preserved_case = restored.capitalize() if tok[0].isupper() else restored
+                rescored_tokens.append(preserved_case)
+                corrections.append({
+                    "raw_ctc": tok,
+                    "rescored_gofatho": preserved_case,
+                    "phonemic_distance": 0.35,
+                    "reason": "Glottal Stop '7' / Gemination Restoration",
+                })
+                continue
             if low in self._vocab_cache:
                 rescored_tokens.append(tok.replace("'", "7"))
                 continue
             # Also check if FST decomposer recognizes a valid inflected Gofatho form (e.g. qaalati = qaala + -ti)
-            conn_tmp = sqlite3.connect(self.db_path)
-            fst_tok = self.rag_engine.fst.analyze_token_fst(low, conn_tmp)
-            conn_tmp.close()
-            if fst_tok.get("stripped_suffixes") and fst_tok.get("english_gloss") != "Contextual stem":
-                rescored_tokens.append(tok.replace("'", "7"))
-                continue
+            if conn_tmp is not None:
+                try:
+                    fst_tok = self.rag_engine.fst.analyze_token_fst(low, conn_tmp)
+                    if fst_tok.get("stripped_suffixes") and fst_tok.get("english_gloss") != "Contextual stem":
+                        rescored_tokens.append(tok.replace("'", "7"))
+                        continue
+                except sqlite3.OperationalError:
+                    pass
 
-            # Find closest lexicon word by phonemic edit distance
+            # Find closest lexicon word by phonemic edit distance (preferring candidates that restore '7' or gemination on tie)
             best_w = None
             best_dist = 999.0
             for cand in self._vocab_cache:
                 if abs(len(cand) - len(low)) > 2:
                     continue
                 d = edit_distance_phonemic(low, cand)
-                if d < best_dist:
+                if d < best_dist or (d == best_dist and d <= 0.35 and "7" in cand and (not best_w or "7" not in best_w)):
                     best_dist = d
                     best_w = cand
-                    if d <= 0.35:
-                        break
 
             if best_w and best_dist <= 1.0 and len(low) >= 3:
                 preserved_case = best_w.capitalize() if tok[0].isupper() else best_w
@@ -137,6 +169,8 @@ class GofathoVoiceAssistantPipeline:
             else:
                 rescored_tokens.append(tok.replace("'", "7"))
 
+        if conn_tmp is not None:
+            conn_tmp.close()
         rescored_text = ""
         for i, t in enumerate(rescored_tokens):
             if i > 0 and re.match(r"^[A-Za-z7]+$", t):

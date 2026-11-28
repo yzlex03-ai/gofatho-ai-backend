@@ -3,10 +3,17 @@ services:
     name: gofatho-ai-rag-server
     runtime: docker
     plan: free
+    healthCheckPath: /api/v1/health
     envVars:
       - key: PORT
         value: 7860
       - key: GOFATHO_DB_PATH
         value: /app/data/gofatho_ai_master.sqlite
+      - key: GOFATHO_RATE_LIMIT_PER_MIN
+        value: 60
+      - key: ALLOWED_ORIGINS
+        value: https://gofatho-ai-backend-1.onrender.com,http://localhost:7860,http://127.0.0.1:7860,http://10.0.2.2:7860
       - key: GEMINI_API_KEY
+        sync: false
+      - key: GOFATHO_ADMIN_API_KEY
         sync: false

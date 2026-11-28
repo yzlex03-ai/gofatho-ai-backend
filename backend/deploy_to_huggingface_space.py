@@ -33,7 +33,7 @@ def deploy_gofatho_to_hf_space(
     api.create_repo(
         repo_id=repo_id,
         repo_type="space",
-        space_sdk="docker", space_hardware="cpu-basic",
+        space_sdk="docker",
         private=False,
         exist_ok=True,
     )

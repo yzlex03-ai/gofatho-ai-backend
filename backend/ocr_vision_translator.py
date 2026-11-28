@@ -31,15 +31,19 @@ class GofathoOcrVisionPipeline:
         gof_fid = clean if is_eth else self.translit.latin_to_fidel(clean)
         morph_tokens = self.analyzer.analyze_sentence(gof_lat)
 
-        # Look up matching document or phrase translations in SQLite
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
-
-        doc_hit = cur.execute(
-            "SELECT * FROM ocr_sample_documents WHERE raw_ocr_text LIKE ? OR normalized_gof_latin LIKE ? LIMIT 1",
-            (f"%{clean[:35]}%", f"%{gof_lat[:35]}%"),
-        ).fetchone()
+        doc_hit = None
+        try:
+            conn = sqlite3.connect(self.db_path)
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            if clean:
+                doc_hit = cur.execute(
+                    "SELECT * FROM ocr_sample_documents WHERE raw_ocr_text LIKE ? OR normalized_gof_latin LIKE ? LIMIT 1",
+                    (f"%{clean[:35]}%", f"%{gof_lat[:35]}%"),
+                ).fetchone()
+            conn.close()
+        except sqlite3.OperationalError:
+            doc_hit = None
 
         if doc_hit:
             amh_out = doc_hit["amharic_translation"]
@@ -53,7 +57,6 @@ class GofathoOcrVisionPipeline:
             notes_out = "; ".join(
                 f"{m['surface']} -> root '{m['root']}'" for m in morph_tokens[:8]
             )
-        conn.close()
 
         return {
             "raw_ocr_text": clean,

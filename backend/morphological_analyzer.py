@@ -191,7 +191,7 @@ def analyze_gofatho_word(word: str, db_conn: sqlite3.Connection = None) -> Dict[
 
     matched_verb = False
     for suf, gloss_form, meaning in VERBAL_SUFFIXES:
-        if len(stem) > len(suf) + 1 and stem.endswith(suf):
+        if len(stem) >= len(suf) + 1 and stem.endswith(suf):
             stem = stem[:-len(suf)]
             morphemes.insert(0, {"morpheme": gloss_form, "gloss": meaning, "type": "Verbal Inflection"})
             matched_verb = True
@@ -212,13 +212,32 @@ def analyze_gofatho_word(word: str, db_conn: sqlite3.Connection = None) -> Dict[
     lex_match = None
     if db_conn is not None:
         cur = db_conn.cursor()
-        for cand in [lower, stem, stem + "-", stem + "a", stem + "e", stem + "o", stem + "i"]:
+        cands = [lower, stem, stem + "-", stem + "a", stem + "e", stem + "o", stem + "i"]
+        if len(stem) >= 2:
+            # MP-06 pre-suffixal gemination restoration & -tt- <-> -th- orthographic alternation
+            cands.extend([stem + stem[-1], stem + stem[-1] + "-", stem + stem[-1] + "a", stem + stem[-1] + "e", stem + stem[-1] + "o"])
+        if "tt" in stem:
+            st_th = stem.replace("tt", "th")
+            cands.extend([st_th, st_th + "a", st_th + "e", st_th + "o"])
+        if len(stem) >= 3 and stem[-1] in "aeiou" and stem[-2] == stem[-1]:
+            # Long final vowel shortened to dictionary citation vowel (e.g. keettaa -> keetta)
+            short_v = stem[:-1]
+            cands.extend([short_v, short_v.replace("tt", "th"), short_v.replace("tt", "th")[:-1] + "e"])
+        for cand in cands:
             row = cur.execute(
-                "SELECT headword, ipa, pos, english, amharic FROM dictionary WHERE normalized_form = ? LIMIT 1",
-                (cand,)
+                "SELECT id, headword, ipa, pos, english, amharic, source FROM dictionary WHERE lower(headword) = ? OR lower(normalized_form) = ? LIMIT 1",
+                (cand, cand)
             ).fetchone()
             if row:
-                lex_match = {"headword": row[0], "ipa": row[1], "pos": row[2], "english": row[3], "amharic": row[4]}
+                lex_match = {
+                    "id": row[0],
+                    "headword": row[1],
+                    "ipa": row[2],
+                    "pos": row[3],
+                    "english": row[4],
+                    "amharic": row[5],
+                    "source": row[6] or "Sellassie Cheru (2015)",
+                }
                 break
 
     morphemes.insert(0, {
@@ -284,11 +303,12 @@ class GofathoMorphologicalAnalyzer:
     def __init__(self, db_path: str):
         self.db_path = db_path
 
-    def analyze_sentence(self, sentence: str) -> List[Dict[str, Any]]:
+    def analyze_sentence(self, sentence: str, conn: sqlite3.Connection = None) -> List[Dict[str, Any]]:
         tokens = [t for t in re.findall(r"[A-Za-z7ʔ']+", sentence) if t]
-        conn = None
+        own_conn = conn is None
         try:
-            conn = sqlite3.connect(self.db_path)
+            if own_conn:
+                conn = sqlite3.connect(self.db_path)
             results = []
             for tok in tokens:
                 res = analyze_gofatho_word(tok, conn)
@@ -300,7 +320,9 @@ class GofathoMorphologicalAnalyzer:
                 results.append({
                     "surface": res["surface"],
                     "fidel": res["fidel"],
-                    "root": res["root"],
+                    "root": lex.get("headword") or res["root"],
+                    "lex_id": lex.get("id"),
+                    "source": lex.get("source"),
                     "english_gloss": lex.get("english"),
                     "amharic_gloss": lex.get("amharic"),
                     "pos": lex.get("pos"),
@@ -308,5 +330,5 @@ class GofathoMorphologicalAnalyzer:
                 })
             return results
         finally:
-            if conn:
+            if own_conn and conn:
                 conn.close()
